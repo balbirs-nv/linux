@@ -3933,6 +3933,8 @@ static int __folio_split(struct folio *folio, unsigned int new_order,
 		     new_folio = next) {
 			next = folio_next(new_folio);
 
+			zone_device_private_split_cb(folio, new_folio);
+
 			expected_refs = folio_expected_ref_count(new_folio) + 1;
 			folio_ref_unfreeze(new_folio, expected_refs);
 
@@ -3958,6 +3960,12 @@ static int __folio_split(struct folio *folio, unsigned int new_order,
 					   new_folio, 0);
 			}
 		}
+
+		/*
+		 * Mark the end of the folio split for device private THP
+		 * split
+		 */
+		zone_device_private_split_cb(folio, NULL);
 		/*
 		 * Unfreeze @folio only after all page cache entries, which
 		 * used to point to it, have been updated with new folios.
