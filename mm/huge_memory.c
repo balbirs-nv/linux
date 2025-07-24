@@ -1713,7 +1713,9 @@ int copy_huge_pmd(struct mm_struct *dst_mm, struct mm_struct *src_mm,
 
 		VM_WARN_ON(!is_pmd_migration_entry(pmd) &&
 				!is_pmd_device_private_entry(pmd));
-		if (!is_readable_migration_entry(entry)) {
+
+		if (is_migration_entry(entry) &&
+			is_writable_migration_entry(entry)) {
 			entry = make_readable_migration_entry(
 							swp_offset(entry));
 			pmd = swp_entry_to_pmd(entry);
@@ -1723,6 +1725,32 @@ int copy_huge_pmd(struct mm_struct *dst_mm, struct mm_struct *src_mm,
 				pmd = pmd_swp_mkuffd_wp(pmd);
 			set_pmd_at(src_mm, addr, src_pmd, pmd);
 		}
+
+		if (is_device_private_entry(entry)) {
+			if (is_writable_device_private_entry(entry)) {
+				entry = make_readable_device_private_entry(
+					swp_offset(entry));
+				pmd = swp_entry_to_pmd(entry);
+
+				if (pmd_swp_soft_dirty(*src_pmd))
+					pmd = pmd_swp_mksoft_dirty(pmd);
+				if (pmd_swp_uffd_wp(*src_pmd))
+					pmd = pmd_swp_mkuffd_wp(pmd);
+				set_pmd_at(src_mm, addr, src_pmd, pmd);
+			}
+
+			src_folio = pfn_swap_entry_folio(entry);
+			VM_WARN_ON(!folio_test_large(src_folio));
+
+			folio_get(src_folio);
+			/*
+			 * folio_try_dup_anon_rmap_pmd does not fail for
+			 * device private entries.
+			 */
+			VM_WARN_ON(folio_try_dup_anon_rmap_pmd(src_folio,
+					  &src_folio->page, dst_vma, src_vma));
+		}
+
 		add_mm_counter(dst_mm, MM_ANONPAGES, HPAGE_PMD_NR);
 		mm_inc_nr_ptes(dst_mm);
 		pgtable_trans_huge_deposit(dst_mm, dst_pmd, pgtable);
@@ -2407,10 +2435,12 @@ int change_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
 			if (pmd_swp_soft_dirty(*pmd))
 				newpmd = pmd_swp_mksoft_dirty(newpmd);
 		} else if (is_writable_device_private_entry(entry)) {
+			entry = make_readable_device_private_entry(
+							swp_offset(entry));
 			newpmd = swp_entry_to_pmd(entry);
-			entry = make_device_exclusive_entry(swp_offset(entry));
-		} else
+		} else {
 			newpmd = *pmd;
+		}
 
 		if (uffd_wp)
 			newpmd = pmd_swp_mkuffd_wp(newpmd);
@@ -2932,30 +2962,34 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 		VM_WARN_ON(!is_migration_entry(swp_entry) &&
 				!is_device_private_entry(swp_entry));
 		page = pfn_swap_entry_to_page(swp_entry);
-		write = is_writable_migration_entry(swp_entry) ||
-			is_writable_device_private_entry(swp_entry);
 
-		if (PageAnon(page))
-			anon_exclusive =
-				is_readable_exclusive_migration_entry(swp_entry);
+		if (is_pmd_migration_entry(old_pmd)) {
+			write = is_writable_migration_entry(swp_entry);
+			if (PageAnon(page))
+				anon_exclusive =
+					is_readable_exclusive_migration_entry(
+								swp_entry);
+			young = is_migration_entry_young(swp_entry);
+			dirty = is_migration_entry_dirty(swp_entry);
+		} else if (is_pmd_device_private_entry(old_pmd)) {
+			write = is_writable_device_private_entry(swp_entry);
+			anon_exclusive = PageAnonExclusive(page);
+			if (freeze && anon_exclusive &&
+			    folio_try_share_anon_rmap_pmd(folio, page))
+				freeze = false;
+			if (!freeze) {
+				rmap_t rmap_flags = RMAP_NONE;
+
+				folio_ref_add(folio, HPAGE_PMD_NR - 1);
+				if (anon_exclusive)
+					rmap_flags |= RMAP_EXCLUSIVE;
+				folio_add_anon_rmap_ptes(folio, page, HPAGE_PMD_NR,
+							 vma, haddr, rmap_flags);
+			}
+		}
+
 		soft_dirty = pmd_swp_soft_dirty(old_pmd);
 		uffd_wp = pmd_swp_uffd_wp(old_pmd);
-		young = is_migration_entry_young(swp_entry);
-		dirty = is_migration_entry_dirty(swp_entry);
-
-		/*
-		 * With migration entries, those should have already had the
-		 * anon_exclusive flag handled the first time through
-		 * try_to_migrate_one() path.
-		 *
-		 * For device private entries, "freeze" should always be
-		 * passed as true.
-		 */
-		VM_WARN_ON(is_device_private_entry(swp_entry) && !freeze);
-
-		if (freeze && anon_exclusive &&
-			is_device_private_entry(swp_entry))
-			ClearPageAnonExclusive(page);
 	} else {
 		/*
 		 * Up to this point the pmd is present and huge and userland has
@@ -3062,7 +3096,25 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 				if (uffd_wp)
 					entry = pte_swp_mkuffd_wp(entry);
 			} else {
-				VM_WARN_ONCE(1, "Unexpected !freeze and device private entry");
+				/*
+				 * anon_exclusive was already propagated to the relevant
+				 * pages corresponding to the pte entries when freeze
+				 * is false.
+				 */
+				if (write)
+					swp_entry = make_writable_device_private_entry(
+								page_to_pfn(page + i));
+				else
+					swp_entry = make_readable_device_private_entry(
+								page_to_pfn(page + i));
+				/*
+				 * Young and dirty bits are not progated via swp_entry
+				 */
+				entry = swp_entry_to_pte(swp_entry);
+				if (soft_dirty)
+					entry = pte_swp_mksoft_dirty(entry);
+				if (uffd_wp)
+					entry = pte_swp_mkuffd_wp(entry);
 			}
 			VM_WARN_ON(!pte_none(ptep_get(pte + i)));
 			set_pte_at(mm, addr, pte + i, entry);
